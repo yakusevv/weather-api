@@ -1,46 +1,34 @@
 import datetime
-import os
-import requests
-import pymongo
 
-from fastapi import FastAPI
-from fastapi_amis_admin.admin.settings import Settings
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi_amis_admin.admin.settings import Settings as AdminSettings
 from fastapi_amis_admin.admin.site import AdminSite
+from fastapi_amis_admin import i18n
 from fastapi_scheduler import SchedulerAdmin
+from pydantic import BaseModel
 
-API_KEY = os.environ.get('API_KEY')
-LAT = os.environ.get('LAT')
-LON = os.environ.get('LON')
+from .utils import get_data_collection, get_temperature
+from . import settings
 
+
+i18n.set_language(language='en_US')
 
 app = FastAPI()
-
-site = AdminSite(settings=Settings(database_url_async='sqlite+aiosqlite:///amisadmin.db'))
+site = AdminSite(
+    settings=AdminSettings(
+        database_url_async='sqlite+aiosqlite:///amisadmin.db',
+    )
+)
 scheduler = SchedulerAdmin.bind(site)
 site.mount_app(app)
 
 
-def get_data_collection():
-    client = pymongo.MongoClient(
-        'mongodb://mongodb:27017/',
-        username=os.environ.get('MONGO_USER'),
-        password=os.environ.get('MONGO_PASS')
-    )
-    return client[os.environ.get('MONGO_DB')].temperature_info
+class ResponseModel(BaseModel):
+    error: str | None
+    data: dict | None
 
 
-def get_temperature():
-    resp = requests.get(
-        f'https://api.openweathermap.org/data/2.5/weather?lat={LAT}&lon={LON}&appid={API_KEY}&units=metric'
-    )
-    if resp.status_code != 200:
-        raise Exception(f'openweather api error: {resp.status_code}, {resp.reason}')
-    return resp.json()['main'].get('temp')
-
-# testing
-# @scheduler.scheduled_job('cron', hour='0-23', minute='0-59', second='0,10,20,30,40,50')
-# @scheduler.scheduled_job('cron', hour='0-23', minute='0-59')
-@scheduler.scheduled_job('cron', hour='0-23')
+@scheduler.scheduled_job('cron', hour='0-23', minute='0')
 def cron_task_test():
     now = datetime.datetime.now()
 
@@ -51,30 +39,45 @@ def cron_task_test():
 
     col = get_data_collection()
     col.update_one(
-        {'_id': now.strftime('%Y-%m-%d')}, {'$set': {now.strftime('%H'): temp}},
-        # {'_id': now.strftime('%Y-%m-%d')}, {'$set': {now.strftime('%H:%M'): temp}},
+        {'_id': now.strftime('%Y-%m-%d')}, {'$set': {now.strftime('%H:%M'): temp}},
         upsert=True
     )
-    # print(f'get temp for {now}')
 
 
-@app.get("/api/temperature_info/")
-def get_temperature_info(date: str):
-        
-    try:
-        data = get_data_collection().find_one({'_id': date}) or {}
-    except Exception as exc:
-        return {'error': str(exc)}
-    return {
-        f'{str(k).zfill(2)}:00': data.get(str(k).zfill(2), '-') for k in range(0,24)
+def middleware(x_token: str = Header(pattern='.{32}')):
+    if x_token != settings.X_TOKEN:
+      raise HTTPException(status_code=403, detail='wrong x-token')
+
+
+@app.get(
+    "/api/temperature_info/",
+    dependencies=[Depends(middleware)],
+    response_model=ResponseModel)
+def get_temperature_info(date: datetime.date):
+    response = {
+        'data': None,
+        'error': None
     }
-    
-    # try:
-    #     temp = get_temperature()
-    # except Exception as exc:
-    #     return {'error': str(exc)}
-    # return {'test': temp}
-    
+
+    try:
+        data = get_data_collection().find_one({'_id': date.strftime('%Y-%m-%d')})
+    except Exception as exc:
+        response['error'] = f'error while getting data: {exc}'
+    else:
+        if data is None:
+            response['error'] = f'there is no data for this date: {date}'
+        else:
+            response['data'] = {
+                # just to fill empty values
+                # WARN: for now cron makes requests every hour
+                # and data is stored with key in format '%H:%M'
+                # if timing will be changed we may get empty dict here
+                # TODO: return data as it is instead? (without empty values filling)
+                f'{"%02d" % k}:00': data.get(f'{"%02d" % k}:00')
+                for k in range(0,24)
+            }
+    return response
+
 
 
 @app.on_event("startup")
